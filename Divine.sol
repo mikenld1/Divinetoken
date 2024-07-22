@@ -1,33 +1,43 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.26;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; // Add ReentrancyGuard
+
+interface IPancakeFactory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+interface IPancakeRouter {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+}
 
 /**
  * @title DivineQuantaToken
- * @dev Custom ERC20 token with transaction limits, cooldowns, and owner privileges for configuration.
+ * @dev Custom ERC20 token with transaction limits, cooldowns in blocks, and owner privileges for configuration.
  */
-contract DivineQuantaToken is ERC20, Ownable {
+contract DivineQuantaToken is ERC20, Ownable, ReentrancyGuard { // Use ReentrancyGuard
     uint256 public constant MAX_SUPPLY = 10 * 10**9 * 10**18; // 10 billion tokens with 18 decimals
-    uint256 public constant MIN_WALLET_LIMIT = (MAX_SUPPLY * 1) / 1000; // 0.1% of total supply
-    uint256 public constant MAX_TRANSACTION_COOLDOWN = 60; // 60 seconds
+    uint256 public constant MAX_TRANSACTION_COOLDOWN = 5; // 5 blocks
 
     uint256 public maxTransactionAmount = (MAX_SUPPLY * 1) / 1000; // 0.1% of total supply
     string public tokenURI;
     uint256 public transactionCooldown = MAX_TRANSACTION_COOLDOWN;
-
+    
+    mapping(address => bool) public liquidityPairs; // Mapping to track liquidity pairs
+    address public INITIAL_LIQUIDITY_PAIR; // Track initial liquidity pair
     address[] private exemptedAddresses; // List of exempted addresses
-    mapping(address => uint256) public walletLimit; // Limits for each wallet
-    mapping(address => uint256) private lastTransactionTime; // Last transaction timestamp for cooldown enforcement
+    mapping(address => uint256) private lastTransactionBlock; // Last transaction block for cooldown enforcement
     mapping(address => bool) public exemptFromLimit; // Exemption list for addresses not subject to transaction limit
-    bool private immutable _initialMintingDone; // Flag to ensure no further minting after initial mint
+    bool private _initialMintingDone = false; // Flag to ensure no further minting after initial mint
 
     // Define events for logging
     event MaxTransactionAmountUpdated(uint256 newMaxTransactionAmount);
-    event WalletLimitUpdated(address indexed wallet, uint256 newLimit);
     event ExemptionStatusUpdated(address indexed wallet, bool isExempt);
     event TransactionCooldownUpdated(uint256 newCooldown);
+    event LiquidityPairCreated(string dexName, address indexed pair);
 
     /**
      * @dev Sets the name, symbol, and initial supply of the token. Exempts the deployer from transaction limits.
@@ -35,9 +45,18 @@ contract DivineQuantaToken is ERC20, Ownable {
     constructor() ERC20("Divine Quanta Token", "DQT") Ownable(msg.sender) {
         _mintInitialSupply(msg.sender, MAX_SUPPLY);
         tokenURI = "https://divinequanta.com/devine.json";
-        walletLimit[msg.sender] = MAX_SUPPLY;
         exemptFromLimit[msg.sender] = true;
         _initialMintingDone = true;
+        
+        // Pancakeswap mainnet router address
+        IPancakeRouter PANCAKE_ROUTER = IPancakeRouter(0x10ED43C718714eb63d5aA57B78B54704E256024E);
+        
+        // Creating liquidity pair for CURRENT TOKEN/WBNB
+        address liquidityPair = IPancakeFactory(PANCAKE_ROUTER.factory()).createPair(address(this), PANCAKE_ROUTER.WETH());
+        liquidityPairs[liquidityPair] = true;
+        INITIAL_LIQUIDITY_PAIR = liquidityPair;
+        
+        emit LiquidityPairCreated("PancakeSwap", liquidityPair);
     }
 
     /**
@@ -56,7 +75,7 @@ contract DivineQuantaToken is ERC20, Ownable {
      * @param amount The amount of tokens to transfer.
      * @return bool indicating the success of the transfer.
      */
-    function transfer(address recipient, uint256 amount) public override returns (bool) {
+    function transfer(address recipient, uint256 amount) public override nonReentrant returns (bool) { // Add nonReentrant
         _applyTransferLimits(msg.sender, recipient, amount);
         return super.transfer(recipient, amount);
     }
@@ -68,7 +87,7 @@ contract DivineQuantaToken is ERC20, Ownable {
      * @param amount The amount of tokens to transfer.
      * @return bool indicating the success of the transfer.
      */
-    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+    function transferFrom(address sender, address recipient, uint256 amount) public override nonReentrant returns (bool) { // Add nonReentrant
         _applyTransferLimits(sender, recipient, amount);
         return super.transferFrom(sender, recipient, amount);
     }
@@ -80,56 +99,51 @@ contract DivineQuantaToken is ERC20, Ownable {
      * @param amount The amount of tokens to transfer.
      */
     function _applyTransferLimits(address sender, address recipient, uint256 amount) private {
-        if (!exemptFromLimit[sender]) {
+        if (!exemptFromLimit[sender] && !exemptFromLimit[recipient]) {
+       
             require(amount <= maxTransactionAmount, "Transfer exceeds the max allowed amount per transaction.");
-            require(balanceOf(recipient) + amount <= walletLimit[recipient], "Recipient wallet limit exceeded.");
-            require(block.number >= lastTransactionTime[sender] + transactionCooldown, "Sender cooldown period not met.");
-            require(block.number >= lastTransactionTime[recipient] + transactionCooldown, "Recipient cooldown period not met.");
-            lastTransactionTime[sender] = block.number;
-            lastTransactionTime[recipient] = block.number;
+        
+            if (!liquidityPairs[recipient]) {
+                require(block.number >= lastTransactionBlock[recipient] + transactionCooldown, "Recipient cooldown period not met.");
+                lastTransactionBlock[recipient] = block.number;
+            }
+
+            if (!liquidityPairs[sender]) {
+                require(block.number >= lastTransactionBlock[sender] + transactionCooldown, "Sender cooldown period not met.");
+                lastTransactionBlock[sender] = block.number;
+            }
         }
     }
 
     /**
      * @dev Allows the owner to update the maximum transaction amount.
-     * @param maxTxAmount The new maximum transaction amount.
+     * @param _maxTxAmount The new maximum transaction amount.
      */
-    function updateMaxTransactionAmount(uint256 maxTxAmount) public onlyOwner {
-        require(maxTxAmount >= (MAX_SUPPLY * 1) / 1000, "New max transaction amount must be greater than or equal to 0.1% of total supply.");
-        maxTransactionAmount = maxTxAmount;
-        emit MaxTransactionAmountUpdated(maxTxAmount);
-    }
-
-    /**
-     * @dev Allows the owner to update the wallet limit for a specific address.
-     * @param addr The address to update the limit for.
-     * @param limit The new wallet limit.
-     */
-    function updateWalletLimit(address addr, uint256 limit) public onlyOwner {
-        require(limit >= MIN_WALLET_LIMIT, "New wallet limit is below the minimum limit of 0.1% of total supply.");
-        walletLimit[addr] = limit;
-        emit WalletLimitUpdated(addr, limit);
+    function updateMaxTransactionAmount(uint256 _maxTxAmount) public onlyOwner {
+        require(_maxTxAmount >= (MAX_SUPPLY * 1) / 1000, "New max transaction amount is below the minimum limit.");
+        maxTransactionAmount = _maxTxAmount;
+        emit MaxTransactionAmountUpdated(_maxTxAmount);
     }
 
     /**
      * @dev Allows the owner to exempt an address from transaction and wallet limits.
-     * @param addr The address to exempt.
-     * @param status The exemption status (true or false).
+     * @param _address The address to exempt.
+     * @param _status The exemption status (true or false).
      */
-    function setExemptFromLimit(address addr, bool status) public onlyOwner {
-        if (status && !exemptFromLimit[addr]) {
-            exemptedAddresses.push(addr);
-        } else if (!status && exemptFromLimit[addr]) {
+    function setExemptFromLimit(address _address, bool _status) public onlyOwner {
+        if (_status && !exemptFromLimit[_address]) {
+            exemptedAddresses.push(_address);
+        } else if (!_status && exemptFromLimit[_address]) {
             for (uint256 i = 0; i < exemptedAddresses.length; i++) {
-                if (exemptedAddresses[i] == addr) {
+                if (exemptedAddresses[i] == _address) {
                     exemptedAddresses[i] = exemptedAddresses[exemptedAddresses.length - 1];
                     exemptedAddresses.pop();
                     break;
                 }
             }
         }
-        exemptFromLimit[addr] = status;
-        emit ExemptionStatusUpdated(addr, status);
+        exemptFromLimit[_address] = _status;
+        emit ExemptionStatusUpdated(_address, _status);
     }
 
     /**
@@ -137,9 +151,18 @@ contract DivineQuantaToken is ERC20, Ownable {
      * @param cooldownInBlocks The new cooldown period in blocks.
      */
     function setTransactionCooldown(uint256 cooldownInBlocks) public onlyOwner {
-        require(cooldownInBlocks <= MAX_TRANSACTION_COOLDOWN, "New cooldown period exceeds the maximum limit of 60 seconds.");
+        require(cooldownInBlocks <= MAX_TRANSACTION_COOLDOWN, "New cooldown period exceeds the maximum limit.");
         transactionCooldown = cooldownInBlocks;
         emit TransactionCooldownUpdated(cooldownInBlocks);
+    }
+
+    /**
+     * @dev Function to add a new liquidity pair. Once added, it cannot be removed or changed.
+     * @param newPair The new liquidity pair address to add.
+     */
+    function addNewPair(address newPair, bool status) public onlyOwner {
+        require(newPair != INITIAL_LIQUIDITY_PAIR, "Error");
+        liquidityPairs[newPair] = status;
     }
 
     /**
@@ -172,15 +195,6 @@ contract DivineQuantaToken is ERC20, Ownable {
      */
     function getTransactionCooldown() public view returns (uint256) {
         return transactionCooldown;
-    }
-
-    /**
-     * @dev Returns the wallet limit for a specific address.
-     * @param addr The address to query.
-     * @return The wallet limit for the address.
-     */
-    function getWalletLimit(address addr) public view returns (uint256) {
-        return walletLimit[addr];
     }
 
     /**
